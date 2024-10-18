@@ -4,11 +4,12 @@ import logging
 import time
 import json
 import hmac
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 SPOT = "wss://wbs.mexc.com/ws"
-FUTURES = "wss://contract.mexc.com/ws"
+FUTURES = "wss://contract.mexc.com/edge"
 
 class _WebSocketManager:
     def __init__(self, callback_function, ws_name, api_key=None, api_secret=None,
@@ -77,11 +78,9 @@ class _WebSocketManager:
 
     def is_connected(self):
         try:
-            if self.ws.sock or not self.ws.sock.is_connected:
-                return True
-            else:
-                return False
-        except AttributeError:
+            return hasattr(self, 'ws') and self.ws and self.ws.sock and self.ws.sock.connected
+        except Exception as e:
+            logger.error(f"Error checking connection status: {str(e)}")
             return False
 
     @staticmethod
@@ -105,20 +104,12 @@ class _WebSocketManager:
         """
         Open websocket in a thread.
         """
-        def resubscribe_to_topics():
-            if not self.subscriptions:
-                # There are no subscriptions to resubscribe to, probably
-                # because this is a brand new WSS initialisation so there was
-                # no previous WSS connection.
-                return
-            for subscription_message in self.subscriptions:
-                self.ws.send(subscription_message)
-
         self.attempting_connection = True
 
         # Set endpoint.
         self.endpoint = url
 
+        logger.info(f"WebSocket {self.ws_name} attempting connection to {url}")
 
         # Attempt to connect for X seconds.
         retries = self.retries
@@ -126,55 +117,70 @@ class _WebSocketManager:
             infinitely_reconnect = True
         else:
             infinitely_reconnect = False
+
         while (infinitely_reconnect or retries > 0) and not self.is_connected():
-            logger.info(f"WebSocket {self.ws_name} attempting connection...")
-            self.ws = websocket.WebSocketApp(
-                url=url,
-                on_message=lambda ws, msg: self._on_message(msg),
-                on_close=self._on_close(),
-                on_open=self._on_open(),
-                on_error=lambda ws, err: self._on_error(err)
-            )
+            logger.info(f"WebSocket {self.ws_name} connection attempt {self.retries - retries + 1}")
+            
+            try:
+                self.ws = websocket.WebSocketApp(
+                    url=url,
+                    on_message=lambda ws, msg: self._on_message(msg),
+                    on_close=lambda ws, close_status_code, close_msg: self._on_close(ws, close_status_code, close_msg),
+                    on_open=lambda ws: self._on_open(),
+                    on_error=lambda ws, err: self._on_error(err)
+                )
 
-            # Setup the thread running WebSocketApp.
-            self.wst = threading.Thread(target=lambda: self.ws.run_forever(
-                ping_interval=self.ping_interval,
-                ping_timeout=self.ping_timeout,
-                **self.proxy_settings
-            ))
+                # Setup the thread running WebSocketApp.
+                self.wst = threading.Thread(target=lambda: self.ws.run_forever(
+                    ping_interval=self.ping_interval,
+                    ping_timeout=self.ping_timeout,
+                    **self.proxy_settings
+                ))
 
-            # Configure as daemon; start.
-            self.wst.daemon = True
-            self.wst.start()
+                # Configure as daemon; start.
+                self.wst.daemon = True
+                self.wst.start()
 
-            # setup ping loop
-            self.wsl = threading.Thread(target=lambda: self._ping_loop(
-                ping_payload='{"method":"ping"}',
-                ping_interval=self.ping_interval,
-                ping_timeout=self.ping_timeout
-            ))
+                # Wait for the connection to be established
+                connection_timeout = 30  # Increase timeout to 30 seconds
+                connection_start_time = time.time()
+                while not self.is_connected() and time.time() - connection_start_time < connection_timeout:
+                    time.sleep(0.1)
 
-            self.wsl.daemon = True
-            self.wsl.start()
+                if not self.is_connected():
+                    raise websocket.WebSocketTimeoutException("Connection timed out")
 
-            retries -= 1
-            time.sleep(1)
+                logger.info(f"WebSocket {self.ws_name} connected successfully")
 
-            # If connection was not successful, raise error.
-            if not infinitely_reconnect and retries <= 0:
-                self.exit()
-                raise websocket.WebSocketTimeoutException(
-                    f"WebSocket {self.ws_name} connection failed. Too many "
-                    f"connection attempts. pybit will "
-                    f"no longer try to reconnect.")
+                # setup ping loop
+                self.wsl = threading.Thread(target=lambda: self._ping_loop(
+                    ping_payload='{"method":"ping"}',
+                    ping_interval=self.ping_interval,
+                    ping_timeout=self.ping_timeout
+                ))
 
-        logger.info(f"WebSocket {self.ws_name} connected")
+                self.wsl.daemon = True
+                self.wsl.start()
+
+                break  # Connection successful, exit the retry loop
+
+            except Exception as e:
+                logger.error(f"WebSocket {self.ws_name} connection attempt failed: {str(e)}")
+                retries -= 1
+                if retries > 0:
+                    logger.info(f"Retrying in 5 seconds... ({retries} attempts left)")
+                    time.sleep(5)
+                else:
+                    logger.error(f"WebSocket {self.ws_name} connection failed after all retries")
+                    break
+
+        if not self.is_connected():
+            self.exit()
+            raise websocket.WebSocketException(f"WebSocket {self.ws_name} connection failed after all attempts")
 
         # If given an api_key, authenticate.
         if self.api_key and self.api_secret:
             self._auth()
-
-        resubscribe_to_topics()
 
         self.attempting_connection = False
 
@@ -227,11 +233,11 @@ class _WebSocketManager:
             self._reset()
             self._connect(self.endpoint)
 
-    def _on_close(self):
+    def _on_close(self, ws, close_status_code, close_msg):
         """
         Log WS close.
         """
-        logger.debug(f"WebSocket {self.ws_name} closed.")
+        logger.debug(f"WebSocket {self.ws_name} closed. Status code: {close_status_code}, Message: {close_msg}")
 
     def _reset(self):
         """
@@ -376,7 +382,7 @@ class _FuturesWebSocketManager(_WebSocketManager):
 class _FuturesWebSocket(_FuturesWebSocketManager):
     def __init__(self, **kwargs):
         self.ws_name = "FuturesV1"
-        self.endpoint = "wss://contract.mexc.com/ws"
+        self.endpoint = FUTURES
 
         super().__init__(self.ws_name, **kwargs)
         self.ws = None
@@ -486,7 +492,10 @@ class _SpotWebSocketManager(_WebSocketManager):
         self.callback_directory.pop(topic)
 
 class _SpotWebSocket(_SpotWebSocketManager):
-    def __init__(self, endpoint: str = "wss://wbs.mexc.com/ws", **kwargs):
+    """
+    Spot V3 WebSocket
+    """
+    def __init__(self, endpoint: str = SPOT, **kwargs):
         self.ws_name = "SpotV3"
         self.endpoint = endpoint
 
